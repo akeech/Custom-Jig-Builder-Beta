@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Custom Jig Builder (Web Version)</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; font-family: Arial, sans-serif; }
+    #app { display: flex; height: 100vh; overflow: hidden; }
+
+    #instructions, #controls {
+      width: 250px;
+      padding: 12px;
+      background: #f2f2f2;
+      overflow-y: auto;
+    }
+
+    #canvas-container {
+      flex-grow: 1;
+      background: white;
+      position: relative;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: crosshair;
+    }
+
+    select, input, button {
+      width: 100%;
+      margin-bottom: 8px;
+      padding: 6px;
+      font-size: 14px;
+    }
+
+    #pointList {
+      max-height: 200px;
+      overflow-y: auto;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      padding: 4px;
+      background: #fff;
+      margin-bottom: 8px;
+    }
+
+    .pointItem {
+      cursor: pointer;
+      padding: 2px 4px;
+    }
+
+    .pointItem.selected {
+      background: #cceeff;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- Left panel -->
+    <div id="instructions">
+      <h3>Instructions</h3>
+      <p>
+        - Select enclosure size.<br />
+        - Click and drag canvas to pan.<br />
+        - Zoom with + / - or Fit to Screen.<br />
+        - Enter X, Y coords to add points.<br />
+        - Click a point to edit or drag it.<br />
+        - Export requires name and email.
+      </p>
+      <label>Name:<br /><input type="text" id="nameInput" /></label><br />
+      <label>Email:<br /><input type="email" id="emailInput" /></label>
+    </div>
+
+    <!-- Canvas center -->
+    <div id="canvas-container">
+      <canvas id="jigCanvas"></canvas>
+    </div>
+
+    <!-- Right panel -->
+    <div id="controls">
+      <h3>Controls</h3>
+
+      <label for="enclosureSelect">Enclosure Size</label>
+      <select id="enclosureSelect">
+        <option value="1590B">1590B (2.4 x 4.4 x 1.07)</option>
+        <option value="1590BB">1590BB (3.7 x 4.7 x 1.33)</option>
+        <option value="125B">125B (2.6 x 4.8 x 1.4)</option>
+        <option value="Custom">Custom...</option>
+      </select>
+
+      <button id="toggleOrientationBtn">Toggle Orientation</button>
+
+      <label for="faceSelect">Enclosure Side</label>
+      <select id="faceSelect">
+        <option value="Face">Face</option>
+        <option value="Front">Front</option>
+        <option value="Left">Left</option>
+        <option value="Right">Right</option>
+      </select>
+
+      <label for="xInput">X Coordinate</label>
+      <input type="number" id="xInput" placeholder="X (in)" />
+
+      <label for="yInput">Y Coordinate</label>
+      <input type="number" id="yInput" placeholder="Y (in)" />
+
+      <button id="addPointBtn">Add Point</button>
+      <button id="updatePointBtn">Update Point</button>
+      <button id="deletePointBtn">Delete Point</button>
+
+      <label><input type="checkbox" id="metricToggle" /> Use Metric (mm)</label>
+      <label><input type="checkbox" id="centerlineToggle" checked /> Show Centerlines</label>
+
+      <div id="pointList"></div>
+
+      <button id="exportBtn">Export CSV</button>
+      <button id="zoomInBtn">Zoom In</button>
+      <button id="zoomOutBtn">Zoom Out</button>
+      <button id="fitToScreenBtn">Fit to Screen</button>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("jigCanvas");
+    const ctx = canvas.getContext("2d");
+
+    let width, height;
+    let offsetX = 0;
+    let offsetY = 0;
+    let isPanning = false;
+    let startPan = { x: 0, y: 0 };
+    let scale = 80;
+    let orientationLandscape = false;
+    let useMetric = false;
+    let showCenterlines = true;
+
+    let enclosure = { width: 2.4, height: 4.4, depth: 1.07 };
+    const points = [];
+    let selectedIndex = null;
+    function resizeCanvas() {
+      width = canvas.width = canvas.clientWidth;
+      height = canvas.height = canvas.clientHeight;
+      fitToScreen();
+    }
+
+    function fitToScreen() {
+      offsetX = 0;
+      offsetY = 0;
+      scale = Math.min(width, height) / ((Math.max(enclosure.width, enclosure.height, enclosure.depth) + 2) * 2);
+      draw();
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    canvas.addEventListener("mousedown", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      const clicked = points.findIndex((pt) => {
+        const [px, py] = getPointCoords(pt);
+        return Math.abs(x - px) < 8 && Math.abs(y - py) < 8;
+      });
+
+      if (clicked >= 0) {
+        selectedIndex = clicked;
+        dragging = true;
+        canvas.style.cursor = "grabbing";
+      } else {
+        isPanning = true;
+        startPan = { x: e.clientX, y: e.clientY };
+        canvas.style.cursor = "move";
+      }
+    });
+
+    canvas.addEventListener("mousemove", (e) => {
+      if (isPanning) {
+        offsetX += e.clientX - startPan.x;
+        offsetY += e.clientY - startPan.y;
+        startPan = { x: e.clientX, y: e.clientY };
+        draw();
+      } else if (dragging && selectedIndex !== null) {
+        const pt = points[selectedIndex];
+        const [cx, cy] = faceCenter(pt.face);
+        const newX = (e.offsetX - cx) / scale;
+        const newY = (cy - e.offsetY) / scale;
+        const snap = useMetric ? 2.54 : 0.25;
+        pt.x = Math.round(newX / snap) * snap;
+        pt.y = Math.round(newY / snap) * snap;
+        updateInputs(pt);
+        draw(true);
+      }
+    });
+
+    canvas.addEventListener("mouseup", () => {
+      isPanning = false;
+      dragging = false;
+      canvas.style.cursor = "crosshair";
+      updatePointList();
+    });
+
+    function draw(showOverlay = false) {
+      ctx.clearRect(0, 0, width, height);
+      const spacing = 50;
+      const [w, h, d] = getDims();
+
+      const cx = width / 2 + offsetX;
+      const cy = height / 2 + offsetY;
+
+      const views = {
+        Face: [cx, cy, w, h],
+        Front: [cx, cy - (h/2 + d/2)*scale - spacing, w, d],
+        Left: [cx - (w/2 + d/2)*scale - spacing, cy, d, h],
+        Right: [cx + (w/2 + d/2)*scale + spacing, cy, d, h]
+      };
+
+      for (const [label, [vx, vy, vw, vh]] of Object.entries(views)) {
+        const x0 = vx - vw/2 * scale;
+        const y0 = vy - vh/2 * scale;
+        const x1 = vx + vw/2 * scale;
+        const y1 = vy + vh/2 * scale;
+        ctx.fillStyle = "#eee";
+        ctx.strokeStyle = "black";
+        ctx.lineWidth = 1;
+        ctx.fillRect(x0, y0, vw * scale, vh * scale);
+        ctx.strokeRect(x0, y0, vw * scale, vh * scale);
+
+        ctx.fillStyle = "black";
+        ctx.font = "bold 12px Arial";
+        ctx.fillText(`${label} View`, vx - 30, y0 - 8);
+
+        if (showCenterlines) {
+          ctx.strokeStyle = "#888";
+          ctx.setLineDash([5, 3]);
+          ctx.beginPath();
+          ctx.moveTo(vx, y0);
+          ctx.lineTo(vx, y1);
+          ctx.moveTo(x0, vy);
+          ctx.lineTo(x1, vy);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        ctx.fillStyle = "red";
+        ctx.font = "bold 16px Arial";
+        ctx.fillText("+", vx - 5, vy + 6);
+      }
+
+      for (let i = 0; i < points.length; i++) {
+        const pt = points[i];
+        const [px, py] = getPointCoords(pt);
+        ctx.beginPath();
+        ctx.arc(px, py, 5, 0, Math.PI * 2);
+        ctx.fillStyle = i === selectedIndex ? "red" : "blue";
+        ctx.fill();
+        ctx.fillStyle = "black";
+        ctx.font = "12px Arial";
+        ctx.fillText(pt.label, px + 8, py);
+
+        if (showOverlay && i === selectedIndex) {
+          ctx.setLineDash([3, 2]);
+          ctx.beginPath();
+          ctx.moveTo(px, 0);
+          ctx.lineTo(px, height);
+          ctx.moveTo(0, py);
+          ctx.lineTo(width, py);
+          ctx.strokeStyle = "gray";
+          ctx.stroke();
+          ctx.setLineDash([]);
+          const dispX = useMetric ? pt.x * 25.4 : pt.x;
+          const dispY = useMetric ? pt.y * 25.4 : pt.y;
+          ctx.fillText(`(${dispX.toFixed(2)}, ${dispY.toFixed(2)}) ${useMetric ? "mm" : "in"}`, px + 10, py - 10);
+        }
+      }
+    }
+
+    function getDims() {
+      let { width, height, depth } = enclosure;
+      if (orientationLandscape) [width, height] = [height, width];
+      return [width, height, depth];
+    }
+
+    function faceCenter(face) {
+      const [w, h, d] = getDims();
+      const cx = width / 2 + offsetX;
+      const cy = height / 2 + offsetY;
+      const spacing = 50;
+      switch (face) {
+        case "Face": return [cx, cy];
+        case "Front": return [cx, cy - (h/2 + d/2)*scale - spacing];
+        case "Left": return [cx - (w/2 + d/2)*scale - spacing, cy];
+        case "Right": return [cx + (w/2 + d/2)*scale + spacing, cy];
+      }
+    }
+
+    function getPointCoords(pt) {
+      const [cx, cy] = faceCenter(pt.face);
+      return [cx + pt.x * scale, cy - pt.y * scale];
+    }
+
+    function updateInputs(pt) {
+      document.getElementById("xInput").value = (useMetric ? pt.x * 25.4 : pt.x).toFixed(2);
+      document.getElementById("yInput").value = (useMetric ? pt.y * 25.4 : pt.y).toFixed(2);
+      document.getElementById("faceSelect").value = pt.face;
+    }
+    function updatePointList() {
+      const list = document.getElementById("pointList");
+      list.innerHTML = "";
+      points.forEach((pt, i) => {
+        const dispX = useMetric ? pt.x * 25.4 : pt.x;
+        const dispY = useMetric ? pt.y * 25.4 : pt.y;
+        const item = document.createElement("li");
+        item.textContent = `${pt.label}: ${pt.face} (${dispX.toFixed(2)}, ${dispY.toFixed(2)})`;
+        item.onclick = () => {
+          selectedIndex = i;
+          updateInputs(pt);
+          draw();
+        };
+        list.appendChild(item);
+      });
+    }
+
+    function addPoint() {
+      const x = parseFloat(document.getElementById("xInput").value);
+      const y = parseFloat(document.getElementById("yInput").value);
+      const face = document.getElementById("faceSelect").value;
+      if (isNaN(x) || isNaN(y)) return;
+      const px = useMetric ? x / 25.4 : x;
+      const py = useMetric ? y / 25.4 : y;
+      const label = String.fromCharCode(65 + points.length);
+      points.push({ x: px, y: py, face, label });
+      selectedIndex = points.length - 1;
+      updatePointList();
+      draw();
+    }
+
+    function updatePoint() {
+      if (selectedIndex === null) return;
+      const x = parseFloat(document.getElementById("xInput").value);
+      const y = parseFloat(document.getElementById("yInput").value);
+      const face = document.getElementById("faceSelect").value;
+      if (isNaN(x) || isNaN(y)) return;
+      const pt = points[selectedIndex];
+      pt.x = useMetric ? x / 25.4 : x;
+      pt.y = useMetric ? y / 25.4 : y;
+      pt.face = face;
+      updatePointList();
+      draw();
+    }
+
+    function deletePoint() {
+      if (selectedIndex === null) return;
+      points.splice(selectedIndex, 1);
+      points.forEach((pt, i) => pt.label = String.fromCharCode(65 + i));
+      selectedIndex = null;
+      updatePointList();
+      draw();
+    }
+
+    function toggleMetric() {
+      useMetric = !useMetric;
+      updatePointList();
+      draw();
+    }
+
+    function toggleCenterlines() {
+      showCenterlines = !showCenterlines;
+      draw();
+    }
+
+    function exportCSV() {
+      const name = document.getElementById("nameInput").value.trim();
+      const email = document.getElementById("emailInput").value.trim();
+      if (!name || !email) {
+        alert("Name and email required.");
+        return;
+      }
+      let csv = `Name:,${name}\nEmail:,${email}\n\nLabel,Face,X (${useMetric ? "mm" : "in"}),Y (${useMetric ? "mm" : "in"})\n`;
+      points.forEach((pt) => {
+        const x = useMetric ? pt.x * 25.4 : pt.x;
+        const y = useMetric ? pt.y * 25.4 : pt.y;
+        csv += `${pt.label},${pt.face},${x.toFixed(2)},${y.toFixed(2)}\n`;
+      });
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "jig_points.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    document.getElementById("addPointBtn").onclick = addPoint;
+    document.getElementById("updatePointBtn").onclick = updatePoint;
+    document.getElementById("deletePointBtn").onclick = deletePoint;
+    document.getElementById("toggleOrientationBtn").onclick = () => {
+      orientationLandscape = !orientationLandscape;
+      fitToScreen();
+    };
+    document.getElementById("toggleMetricBtn").onclick = toggleMetric;
+    document.getElementById("toggleCenterBtn").onclick = toggleCenterlines;
+    document.getElementById("fitBtn").onclick = fitToScreen;
+    document.getElementById("zoomInBtn").onclick = () => { scale *= 1.2; draw(); };
+    document.getElementById("zoomOutBtn").onclick = () => { scale /= 1.2; draw(); };
+    document.getElementById("exportBtn").onclick = exportCSV;
+
+    fitToScreen();
+  </script>
+</body>
+</html>
